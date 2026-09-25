@@ -7,6 +7,14 @@ A scheduled check of Elio's two public health endpoints. It holds no application
 
 GitHub Actions requests `/api/health` every 10 minutes and both endpoints every 30 minutes. Readiness runs less often because each check wakes the database, which then stays up for 5 minutes. If either fails twice in a row, the workflow opens one issue labelled `outage` and assigns it to the repository owner. The first passing run afterwards closes the issue.
 
+## Role
+
+This repository is the readiness check and the record of outages, not the pager. The primary uptime alarm is UptimeRobot: a keyword monitor on `/api/health` that alerts when `"ok":true` is missing, and an HTTP monitor on studywithelio.com, both every 5 minutes, alerting by email and app push. They were set up on 2026-09-25, and a drill monitor on a failing URL alerted in about 3 minutes.
+
+UptimeRobot's help center page "Who Should Use UptimeRobot's Free Plan?", checked on 2026-09-25, allows any use of the free plan, commercial included. It was personal-only from December 2024 into 2026, so check the page again if the plan terms matter.
+
+GitHub's schedule is best-effort. On 2026-09-25 it started no scheduled run at all in the first 1 hour 43 minutes after this workflow was created, with Actions reported operational.
+
 ## How fast it notices
 
 The schedule is nominal. GitHub starts scheduled runs late, often by 5 to 15 minutes or more, and can skip them when it is under load. Plan on a health failure being noticed within 20 to 30 minutes, and a database failure within about 45. Once the app's own error reporting is enabled, failed requests from real users will be reported sooner than this.
