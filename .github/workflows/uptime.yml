@@ -92,7 +92,9 @@ jobs:
               if [ "$attempt" = "1" ]; then sleep 20; fi
             done
             local detail
-            detail=$(jq -c '{code, db, version, commit}' body.json 2> /dev/null || head -c 200 body.json 2> /dev/null)
+            # One line: a non-JSON body (an HTML error page) would otherwise
+            # break the issue's inline code across lines.
+            detail=$(jq -c '{code, db, version, commit}' body.json 2> /dev/null || head -c 160 body.json 2> /dev/null | tr -s '\r\n\t' '   ')
             echo "- **$name**: HTTP $code from $url ${detail:+(\`$detail\`)}" >> failures.md
             return 1
           }
