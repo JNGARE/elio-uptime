@@ -1,0 +1,166 @@
+name: uptime
+
+# Probes Elio's public health endpoint every 10 minutes, and the database
+# readiness endpoint every 30, and opens one issue, assigned to the repository
+# owner, when either fails twice in a row. The issue closes itself on the first
+# passing run after it.
+#
+# Why readiness runs less often: it wakes the Neon compute, which then stays up
+# for its 5-minute suspend timeout. Every 10 minutes would keep it awake about
+# half of every otherwise idle hour; every 30 costs about a sixth. Once the
+# app's own error reporting is enabled, user requests that fail on the database
+# will be reported there too, so a database outage will not only be visible here.
+#
+# Why a separate public repository: Elio's own repository is private, where
+# every run bills at least one Actions minute. 144 runs a day would exceed the
+# free quota on its own and stop CI with it. Public repositories run Actions
+# without a minute charge. This repository holds no application code.
+#
+# The readiness check needs the repository secret ELIO_PROBE_TOKEN, the same
+# value as the Worker secret of that name. Without it the Worker answers
+# readiness with db: 'not-checked' and no database round trip, and this check
+# fails, so a missing token is loud rather than a silent pass. The token is sent
+# only to production, never to a drill URL.
+#
+# Settings (repository variables, all optional):
+#   ELIO_BASE_URL     override the target, for a drill. Unset means production.
+#   CHECK_READINESS   'false' skips /api/health/ready, for a Worker that does
+#                     not serve it yet. Unset means check it.
+
+on:
+  schedule:
+    # Health every 10 minutes, off the top of the hour, when GitHub's scheduler
+    # is busiest and delays runs the most.
+    - cron: '3,13,23,33,43,53 * * * *'
+    # Health and readiness every 30 minutes.
+    - cron: '8,38 * * * *'
+    # Monthly keepalive. GitHub disables schedules in a public repository after
+    # 60 days without activity; the keepalive job below pushes one empty commit.
+    - cron: '17 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Target to probe instead of production (a drill). Leave empty for production.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  PRODUCTION_URL: https://elio.jndemo13.workers.dev
+  BASE_URL: ${{ inputs.base_url || vars.ELIO_BASE_URL || 'https://elio.jndemo13.workers.dev' }}
+  CHECK_READINESS: ${{ vars.CHECK_READINESS || 'true' }}
+  READINESS_RUN: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '8,38 * * * *' }}
+
+jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule != '17 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Probe health and readiness
+        id: probe
+        shell: bash
+        env:
+          PROBE_TOKEN: ${{ secrets.ELIO_PROBE_TOKEN }}
+        run: |
+          set -uo pipefail
+          : > failures.md
+          probe() {
+            local name="$1" url="$2" want_db="$3" code="000" attempt
+            local -a extra=()
+            if [ "$want_db" = "yes" ] && [ "$BASE_URL" = "$PRODUCTION_URL" ] && [ -n "${PROBE_TOKEN:-}" ]; then
+              extra=(-H "x-elio-probe-token: $PROBE_TOKEN")
+            fi
+            for attempt in 1 2; do
+              code=$(curl -sS -o body.json -w '%{http_code}' --max-time 15 \
+                -H 'cache-control: no-cache' -A 'elio-uptime (GitHub Actions)' ${extra[@]+"${extra[@]}"} "$url") || code="000"
+              if [ "$code" = "200" ] && jq -e --arg want "$want_db" '.ok == true and ($want != "yes" or .db == "ok")' body.json > /dev/null 2>&1; then
+                echo "$name ok: $(jq -c '{version, commit, db, dbLatencyMs, cached}' body.json)"
+                return 0
+              fi
+              echo "$name attempt $attempt failed: HTTP $code $(head -c 300 body.json 2> /dev/null)"
+              # One retry after 20 s. A Neon compute that was suspended can miss
+              # the 2 s readiness limit on its first wake, and the Worker caches
+              # a readiness answer for 10 s, so the retry gets a fresh check.
+              if [ "$attempt" = "1" ]; then sleep 20; fi
+            done
+            local detail
+            detail=$(jq -c '{code, db, version, commit}' body.json 2> /dev/null || head -c 200 body.json 2> /dev/null)
+            echo "- **$name**: HTTP $code from $url ${detail:+(\`$detail\`)}" >> failures.md
+            return 1
+          }
+          status=0
+          probe health "$BASE_URL/api/health" no || status=1
+          if [ "$CHECK_READINESS" != "false" ] && [ "$READINESS_RUN" = "true" ]; then
+            probe readiness "$BASE_URL/api/health/ready" yes || status=1
+          fi
+          cat failures.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Open the outage issue
+        if: failure() && steps.probe.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A drill against another URL gets its own label, so a passing drill
+          # can never close a real outage and a real outage never hides a drill.
+          label="outage"; drill=""
+          if [ "$BASE_URL" != "$PRODUCTION_URL" ]; then label="outage-drill"; drill="[drill] "; fi
+          open=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$label" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            # Already open: the issue is the alert. A comment every 10 minutes
+            # would be an email every 10 minutes, so the run log carries it.
+            echo "Outage issue #$open is already open."
+            exit 0
+          fi
+          gh label create "$label" --repo "$GITHUB_REPOSITORY" --color B60205 --description 'Opened by the uptime check' 2> /dev/null || true
+          {
+            echo "The uptime check failed twice in a row at $(date -u +%Y-%m-%dT%H:%MZ)."
+            echo
+            cat failures.md
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "This issue closes itself on the next passing run."
+          } > issue.md
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "${drill}Elio is failing its uptime check" \
+            --label "$label" --assignee "$GITHUB_REPOSITORY_OWNER" --body-file issue.md
+
+      - name: Close the outage issue on recovery
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          label="outage"
+          if [ "$BASE_URL" != "$PRODUCTION_URL" ]; then label="outage-drill"; fi
+          for number in $(gh issue list --repo "$GITHUB_REPOSITORY" --label "$label" --state open --json number --jq '.[].number'); do
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Passing again at $(date -u +%Y-%m-%dT%H:%MZ): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done
+
+  keepalive:
+    if: github.event.schedule == '17 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push one empty commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --allow-empty -m 'keepalive: keep the uptime schedule enabled'
+          git push
